@@ -1,0 +1,42 @@
+﻿# MirrorTalk — 一键部署配置
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: MirrorTalk/backend/Dockerfile
+    container_name: mirrortalk-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - mirrortalk_data:/app/data          # SQLite + ChromaDB 持久化
+      - model_cache:/root/.cache           # BGE 模型缓存
+    environment:
+      - MIRRORTALK_LLM_PROVIDER=
+      - MIRRORTALK_LLM_API_KEY=
+      - MIRRORTALK_LLM_BASE_URL=
+      - MIRRORTALK_LLM_MODEL=
+      - MIRRORTALK_EMBED_MODE=
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: MirrorTalk/frontend/Dockerfile
+    container_name: mirrortalk-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mirrortalk_data:
+  model_cache:

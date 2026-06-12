@@ -1,0 +1,45 @@
+[project]
+name = "mirrortalk"
+version = "0.1.0"
+description = "MirrorTalk - AI 虚拟好友对话与用户替身系统"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "langgraph>=0.2",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "langchain-core>=0.3",
+    "langchain-openai>=0.3",
+    "openai>=1.68",
+    "anthropic>=0.45",
+    "google-genai>=1.10",
+    "sentence-transformers>=3.4",
+    "chromadb>=0.6",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "instructor>=1.7",
+    "httpx>=0.28",
+    "python-multipart>=0.0.20",
+    "aiofiles>=24.1",
+    "tiktoken>=0.8",
+    "ijson>=3.3",
+    "jieba>=0.42",
+    "langchain-text-splitters>=0.3",
+    "PyMuPDF>=1.25",
+    "python-docx>=1.1",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    "langchain-text-splitters>=0.3",
+]
+
+[project.optional-dependencies]
+local = [
+    "FlagEmbedding>=1.3",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]

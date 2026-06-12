@@ -1,0 +1,38 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment
+.env
+
+# Data (local)
+data/
+*.db
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+# Logs
+logs/
+
+# IDE/Editor local config
+.claude/
+.codex/
+
+# Python test cache
+.pytest_cache/
+
+# Build artifacts
+dist/
+frontend/dist/
+
+# Node
+node_modules/
+
+backend/data/
