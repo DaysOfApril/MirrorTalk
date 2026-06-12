@@ -251,7 +251,24 @@ async def _parse_jsonl(file_path: Path) -> tuple[int, AsyncGenerator, dict]:
                 except json.JSONDecodeError:
                     logger.debug(f"Skipping non-JSON line: {stripped[:80]}")
 
-    return total, generator(), {}
+    # 预扫描 member_map（_type=member 的行）
+    member_map = {}
+    with open(file_path, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                item = json.loads(stripped)
+                if isinstance(item, dict) and item.get("_type") == "member":
+                    pid = item.get("platformId", "")
+                    aname = item.get("accountName", "")
+                    if pid and aname:
+                        member_map[pid] = aname
+            except json.JSONDecodeError:
+                pass
+
+    return total, generator(), member_map
 
 
 # ========== Message Normalization ==========
@@ -299,4 +316,9 @@ def normalize_message(msg: dict, member_map: dict | None = None) -> dict | None:
     result = {"sender": raw_sender, "content": content.strip()}
     if timestamp:
         result["timestamp"] = str(timestamp)
+    # 保留原始 platformId 和 platformMessageId 用于去重
+    if msg.get("sender"):
+        result["platform_id"] = msg["sender"]
+    if msg.get("platformMessageId"):
+        result["platform_message_id"] = str(msg["platformMessageId"])
     return result

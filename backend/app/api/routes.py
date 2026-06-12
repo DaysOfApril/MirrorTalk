@@ -49,6 +49,7 @@ from app.services.database import (
     update_import_task,
     get_import_task,
     list_import_tasks,
+    cancel_import_task,
 )
 from app.services.cache import cache_lookup, cache_store
 from app.services.chunking import default_chunker
@@ -300,6 +301,458 @@ async def list_tasks(status: Optional[str] = None):
     tasks = list_import_tasks(status)
     return {"tasks": tasks}
 
+
+
+
+# ========== 聊天记录管理 ==========
+
+@router.get("/chat-records")
+async def list_chat_records():
+    """列出所有聊天记录文件（按导入任务分组）"""
+    from pathlib import Path as _Path
+    import json as _json
+
+    chat_dir = _Path("data/chat_records")
+    chat_dir.mkdir(parents=True, exist_ok=True)
+
+    # 扫所有 {platformId}.jsonl 文件
+    records = []
+    for fpath in sorted(chat_dir.iterdir()):
+        if not fpath.name.endswith(".jsonl") or fpath.name == "_timeline.jsonl" or fpath.name.startswith("_"):
+            continue
+        platform_id = fpath.stem
+        # 读第一行取 accountName
+        name = platform_id
+        count = 0
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        count += 1
+                        if name == platform_id:
+                            try:
+                                obj = _json.loads(line)
+                                name = obj.get("sender", "") or obj.get("name", platform_id)
+                            except _json.JSONDecodeError:
+                                pass
+        except Exception:
+            pass
+        records.append({
+            "platform_id": platform_id,
+            "name": name,
+            "message_count": count,
+            "file_size": fpath.stat().st_size,
+            "has_persona": False,  # 由前端查
+        })
+
+    return {"records": sorted(records, key=lambda r: r["message_count"], reverse=True)}
+
+
+@router.get("/chat-records/{platform_id}/messages")
+async def stream_chat_messages(platform_id: str, request: Request):
+    """SSE endpoint: 流式返回某人的聊天记录"""
+    import json as _json
+    from pathlib import Path as _Path
+
+    fpath = _Path("data/chat_records") / f"{platform_id}.jsonl"
+    if not fpath.exists():
+        raise HTTPException(404, f"Chat record not found: {platform_id}")
+
+    async def event_stream():
+        NL = "\n"
+        yield f"data: {_json.dumps({'type': 'meta', 'platform_id': platform_id, 'file': fpath.name})}{NL}{NL}"
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        obj = _json.loads(stripped)
+                        yield f"data: {_json.dumps({'type': 'msg', 'data': obj})}{NL}{NL}"
+                    except _json.JSONDecodeError:
+                        pass
+        except Exception as e:
+            yield f"data: {_json.dumps({'type': 'error', 'error': str(e)})}{NL}{NL}"
+        yield f"data: {_json.dumps({'type': 'end'})}{NL}{NL}"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.delete("/chat-records/{platform_id}")
+async def delete_chat_record(platform_id: str):
+    """删除某个用户的聊天记录文件"""
+    from pathlib import Path as _Path
+    _os = __import__("os")
+
+    fpath = _Path("data/chat_records") / f"{platform_id}.jsonl"
+    if not fpath.exists():
+        raise HTTPException(404, f"Chat record not found: {platform_id}")
+    _os.unlink(str(fpath))
+    return {"success": True, "platform_id": platform_id}
+
+
+@router.get("/chat-records/timeline")
+async def stream_timeline(request: Request):
+    """SSE endpoint: 流式返回全量时间线"""
+    import json as _json
+    from pathlib import Path as _Path
+
+    fpath = _Path("data/chat_records") / "_timeline.jsonl"
+    if not fpath.exists():
+        raise HTTPException(404, "Timeline not found. Import chat records first.")
+
+    async def event_stream():
+        NL = "\n"
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        obj = _json.loads(stripped)
+                        yield f"data: {_json.dumps({'type': 'msg', 'data': obj})}{NL}{NL}"
+                    except _json.JSONDecodeError:
+                        pass
+        except Exception as e:
+            yield f"data: {_json.dumps({'type': 'error', 'error': str(e)})}{NL}{NL}"
+        yield f"data: {_json.dumps({'type': 'end'})}{NL}{NL}"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ========== 按需构建画像 ==========
+
+@router.get("/personas/by-platform/{platform_id}")
+async def get_persona_by_platform(platform_id: str):
+    """根据 platformId 查询是否已有画像"""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, name, style_json, ocean_json, message_count FROM personas WHERE id = ?",
+        (platform_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"exists": False, "platform_id": platform_id}
+    return {
+        "exists": True,
+        "platform_id": platform_id,
+        "persona": {
+            "id": row["id"],
+            "name": row["name"],
+            "style": _json.loads(row["style_json"]) if row["style_json"] else {},
+            "ocean": _json.loads(row["ocean_json"]) if row["ocean_json"] else {},
+            "message_count": row["message_count"] or 0,
+        }
+    }
+
+
+@router.post("/personas/by-platform/{platform_id}/build")
+async def build_persona_for_platform(platform_id: str, data: dict = Body(...)):
+    """按需构建某人的画像。参数：
+    {
+        "name": "安卓人",          // 显示名
+        "stage1_provider": "qwen", // 事实提取+风格提取的 provider
+        "stage1_model": "qwen-turbo",
+        "stage2_provider": "deepseek",  // 深度分析的 provider
+        "stage2_model": "deepseek-chat"
+    }
+    """
+    import json as _json, asyncio
+    from pathlib import Path as _Path
+    from app.pipelines.profile_builder import build_persona_pipeline
+    from app.pipelines.deep_profile import build_deep_profile
+
+    fpath = _Path("data/chat_records") / f"{platform_id}.jsonl"
+    if not fpath.exists():
+        raise HTTPException(404, f"Chat record not found: {platform_id}")
+
+    name = data.get("name", platform_id)
+    stage1_provider = data.get("stage1_provider", "qwen")
+    stage1_model = data.get("stage1_model", "qwen-turbo")
+    stage2_provider = data.get("stage2_provider", "deepseek")
+    stage2_model = data.get("stage2_model", "deepseek-chat")
+
+    # 读消息
+    messages = []
+    with open(fpath, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = _json.loads(stripped)
+                messages.append(obj)
+            except _json.JSONDecodeError:
+                pass
+
+    if not messages:
+        raise HTTPException(400, "No messages found in chat record")
+
+    task_id = str(uuid.uuid4())[:16]
+
+    async def _run():
+        try:
+            set_config(f"build_status_{platform_id}", "stage1_running")
+            # Stage 1: 基础画像
+            profile = await build_persona_pipeline(
+                persona_id=platform_id,
+                name=name,
+                messages=messages,
+                speaker=name,
+                message_count=len(messages),
+                extraction_provider=stage1_provider,
+                extraction_model=stage1_model,
+                style_provider=stage1_provider,
+                style_model=stage1_model,
+            )
+            logger.info("Stage 1 complete for %s", platform_id)
+            set_config(f"build_status_{platform_id}", "stage2_running")
+
+            # Stage 2: 深度分析
+            timeline_path = _Path("data/chat_records") / "_timeline.jsonl"
+            deep_result = await build_deep_profile(
+                persona_id=platform_id,
+                name=name,
+                messages=None if timeline_path.exists() else messages,
+                timeline_path=str(timeline_path) if timeline_path.exists() else None,
+                target_speaker=name,
+                stage1_provider=stage1_provider,
+                stage1_model=stage1_model,
+                stage2_provider=stage2_provider,
+                stage2_model=stage2_model,
+            )
+            set_config(f"deep_profile_{platform_id}", _json.dumps(deep_result, ensure_ascii=False))
+            set_config(f"deep_profile_{platform_id}_status", "completed")
+            set_config(f"build_status_{platform_id}", "completed")
+            logger.info("Build complete for %s", platform_id)
+
+        except Exception as e:
+            logger.exception("Build failed for %s", platform_id)
+            set_config(f"build_status_{platform_id}", f"failed: {str(e)[:200]}")
+            set_config(f"deep_profile_{platform_id}_status", f"failed: {str(e)[:200]}")
+
+    asyncio.create_task(_run())
+    return {"task_id": task_id, "status": "running"}
+
+
+@router.post("/personas/by-platform/{platform_id}/build-style")
+async def build_style_for_platform(platform_id: str, data: dict = Body(...)):
+    """只做风格分析"""
+    import json as _json, asyncio
+    from pathlib import Path as _Path
+    from app.pipelines.profile_builder import extract_style as _extract_style
+
+    fpath = _Path("data/chat_records") / f"{platform_id}.jsonl"
+    if not fpath.exists():
+        raise HTTPException(404, f"Chat record not found: {platform_id}")
+
+    provider = data.get("provider", "qwen")
+    model = data.get("model", "qwen-turbo")
+    name = data.get("name", platform_id)
+
+    messages = []
+    with open(fpath, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = _json.loads(stripped)
+                messages.append(obj)
+            except _json.JSONDecodeError:
+                pass
+
+    set_config(f"style_status_{platform_id}", "running")
+
+    async def _run():
+        try:
+            style = await _extract_style(messages, name, provider=provider, model=model)
+            conn = get_db()
+            existing = conn.execute("SELECT style_json FROM personas WHERE id = ?", (platform_id,)).fetchone()
+            if existing:
+                conn.execute("""UPDATE personas SET style_json = ? WHERE id = ?""",
+                    (_json.dumps(style.model_dump(), ensure_ascii=False), platform_id))
+            else:
+                conn.execute("""INSERT INTO personas (id, name, style_json, ocean_json, is_aggregated, source_count, created_at)
+                    VALUES (?, ?, ?, '{}', 0, 1, datetime('now'))""",
+                    (platform_id, name, _json.dumps(style.model_dump(), ensure_ascii=False)))
+            conn.commit()
+            conn.close()
+            set_config(f"style_status_{platform_id}", "completed")
+            logger.info("Style analysis complete for %s", platform_id)
+        except Exception as e:
+            logger.exception("Style analysis failed for %s", platform_id)
+            set_config(f"style_status_{platform_id}", f"failed: {str(e)[:200]}")
+
+    task_id = str(uuid.uuid4())[:16]
+    asyncio.create_task(_run())
+    return {"task_id": task_id, "status": "running"}
+
+
+@router.post("/personas/by-platform/{platform_id}/build-facts")
+async def build_facts_for_platform(platform_id: str, data: dict = Body(...)):
+    """只做原子事实提取"""
+    import json as _json, asyncio
+    from pathlib import Path as _Path
+    from app.pipelines.profile_builder import extract_atomic_facts as _extract_facts
+    from app.services.memory import insert_memory
+    from app.models import MemorySource, MemorySourceType
+
+    fpath = _Path("data/chat_records") / f"{platform_id}.jsonl"
+    if not fpath.exists():
+        raise HTTPException(404, f"Chat record not found: {platform_id}")
+
+    provider = data.get("provider", "qwen")
+    model = data.get("model", "qwen-turbo")
+
+    messages = []
+    with open(fpath, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = _json.loads(stripped)
+                messages.append(obj)
+            except _json.JSONDecodeError:
+                pass
+
+    set_config(f"facts_status_{platform_id}", "running")
+
+    async def _run():
+        try:
+            facts = await _extract_facts(messages, provider=provider, model=model)
+            for f in facts:
+                insert_memory(
+                    source_type=MemorySourceType(f.get("type", "fact")),
+                    source=MemorySource.FRIEND_SPEECH,
+                    content=f["content"],
+                    confidence=0.7,
+                    importance=0.5,
+                )
+            set_config(f"facts_status_{platform_id}", "completed")
+            logger.info("Fact extraction complete for %s: %d facts", platform_id, len(facts))
+        except Exception as e:
+            logger.exception("Fact extraction failed for %s", platform_id)
+            set_config(f"facts_status_{platform_id}", f"failed: {str(e)[:200]}")
+
+    task_id = str(uuid.uuid4())[:16]
+    asyncio.create_task(_run())
+    return {"task_id": task_id, "status": "running"}
+
+
+@router.post("/personas/by-platform/{platform_id}/build-deep")
+async def build_deep_for_platform(platform_id: str, data: dict = Body(...)):
+    """只做深度画像分析（只用该用户本人消息，不用时间线）"""
+    import json as _json, asyncio
+    from pathlib import Path as _Path
+    from app.pipelines.deep_profile import build_deep_profile as _build_deep
+
+    fpath = _Path("data/chat_records") / f"{platform_id}.jsonl"
+    if not fpath.exists():
+        raise HTTPException(404, f"Chat record not found: {platform_id}")
+
+    stage1_provider = data.get("stage1_provider", "qwen")
+    stage1_model = data.get("stage1_model", "qwen-turbo")
+    stage2_provider = data.get("stage2_provider", "deepseek")
+    stage2_model = data.get("stage2_model", "deepseek-chat")
+    name = data.get("name", platform_id)
+
+    messages = []
+    with open(fpath, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = _json.loads(stripped)
+                messages.append(obj)
+            except _json.JSONDecodeError:
+                pass
+
+    # 先同步设置状态，确保前端轮询能立即看到
+    set_config(f"deep_profile_{platform_id}_status", "running")
+
+    async def _run():
+        try:
+            result = await _build_deep(
+                persona_id=platform_id,
+                name=name,
+                messages=messages,
+                timeline_path=None,
+                target_speaker=name,
+                stage1_provider=stage1_provider,
+                stage1_model=stage1_model,
+                stage2_provider=stage2_provider,
+                stage2_model=stage2_model,
+            )
+            set_config(f"deep_profile_{platform_id}", _json.dumps(result, ensure_ascii=False))
+            set_config(f"deep_profile_{platform_id}_status", "completed")
+            logger.info("Deep profile complete for %s", platform_id)
+        except Exception as e:
+            logger.exception("Deep profile failed for %s", platform_id)
+            set_config(f"deep_profile_{platform_id}_status", f"failed: {str(e)[:200]}")
+
+    task_id = str(uuid.uuid4())[:16]
+    asyncio.create_task(_run())
+    return {"task_id": task_id, "status": "running"}
+
+
+@router.get("/personas/by-platform/{platform_id}/build-status")
+
+async def get_persona_build_status(platform_id: str):
+    """查询某人的画像构建状态（style / facts / deep 三种独立状态）"""
+    import json as _json
+
+    style_status = get_config(f"style_status_{platform_id}") or "not_started"
+    facts_status = get_config(f"facts_status_{platform_id}") or "not_started"
+    deep_status = get_config(f"deep_profile_{platform_id}_status") or "not_started"
+    deep_raw = get_config(f"deep_profile_{platform_id}")
+
+    # 检查 personas 表是否有基础画像
+    conn = get_db()
+    row = conn.execute("SELECT id, style_json, ocean_json FROM personas WHERE id = ?", (platform_id,)).fetchone()
+    conn.close()
+
+    stage1_done = row is not None
+    stage2_done = deep_status == "completed"
+
+    return {
+        "platform_id": platform_id,
+        "style_status": style_status,
+        "facts_status": facts_status,
+        "deep_status": deep_status,
+        "stage1_complete": stage1_done,
+        "stage2_complete": stage2_done,
+        "persona": {
+            "style": _json.loads(row["style_json"]) if row and row["style_json"] else {},
+            "ocean": _json.loads(row["ocean_json"]) if row and row["ocean_json"] else {},
+        } if row else None,
+    }
+
+@router.get("/providers/available")
+async def get_available_providers():
+    """返回可用的 provider 列表（用于前端构建画像时的模型选择）"""
+    from app.config import settings as _settings
+    db_cfg = get_all_config()
+    providers_list = []
+
+    for pid in ["ollama", "qwen", "deepseek"]:
+        api_key = db_cfg.get(f"{pid}_api_key") or getattr(_settings, f"{pid}_api_key", "") or ""
+        base_url = db_cfg.get(f"{pid}_base_url") or getattr(_settings, f"{pid}_base_url", "") or ""
+        model = db_cfg.get(f"{pid}_model") or getattr(_settings, f"{pid}_model", "") or ""
+        providers_list.append({
+            "id": pid,
+            "name": {"ollama": "Ollama", "qwen": "通义千问", "deepseek": "DeepSeek"}.get(pid, pid),
+            "has_api_key": bool(api_key) or pid == "ollama",
+            "default_base_url": base_url,
+            "default_model": model,
+        })
+
+    return {"providers": providers_list}
 
 @router.post("/documents/upload")
 async def upload_document(
@@ -634,39 +1087,58 @@ async def delete_memory(memory_id: int):
 # ========== 配置 ==========
 
 def _build_config_response() -> dict:
-    """构建完整配置响应，密钥脱敏"""
+    """构建完整配置响应，密钥脱敏。优先 DB，其次 .env 按 provider 分类的字段，最后通用 fallback。"""
     db_cfg = get_all_config()
+
+    def _val(key: str, *fallbacks: str) -> str:
+        """链式取值: DB -> 各 fallback settings -> 空字符串"""
+        v = db_cfg.get(key)
+        if v:
+            return v
+        for fb in fallbacks:
+            if fb:
+                return fb
+        return ""
+
+    def _set_flag(key: str, *fallbacks: str) -> bool:
+        return bool(db_cfg.get(key) or any(fb for fb in fallbacks))
+
     response = {
         "llm_provider": db_cfg.get("llm_provider") or settings.llm_provider,
-        "llm_model": db_cfg.get("llm_model") or settings.llm_model,
-        "llm_api_key": db_cfg.get("llm_api_key", "") if db_cfg.get("llm_api_key") else "",
-        "llm_api_key_set": bool(db_cfg.get("llm_api_key")),
-        "llm_base_url": db_cfg.get("llm_base_url") or settings.llm_base_url,
-        # Per-provider configs
-        "qwen_api_key": db_cfg.get("qwen_api_key", "") if db_cfg.get("qwen_api_key") else "",
-        "qwen_api_key_set": bool(db_cfg.get("qwen_api_key")),
-        "qwen_base_url": db_cfg.get("qwen_base_url") or "",
-        "qwen_model": db_cfg.get("qwen_model") or "",
-        "deepseek_api_key": db_cfg.get("deepseek_api_key", "") if db_cfg.get("deepseek_api_key") else "",
-        "deepseek_api_key_set": bool(db_cfg.get("deepseek_api_key")),
-        "deepseek_base_url": db_cfg.get("deepseek_base_url") or "",
-        "deepseek_model": db_cfg.get("deepseek_model") or "",
-        "ollama_api_key": db_cfg.get("ollama_api_key", "") if db_cfg.get("ollama_api_key") else "",
-        "ollama_api_key_set": bool(db_cfg.get("ollama_api_key")),
-        "ollama_base_url": db_cfg.get("ollama_base_url") or "",
-        "ollama_model": db_cfg.get("ollama_model") or "",
-        "embed_mode": db_cfg.get("embed_mode") or settings.embed_mode,
-        "embed_remote_provider": db_cfg.get("embed_remote_provider") or settings.embed_remote_provider,
-        "embed_remote_model": db_cfg.get("embed_remote_model") or settings.embed_remote_model,
-        "embed_remote_base_url": db_cfg.get("embed_remote_base_url") or settings.embed_remote_base_url,
-        "embed_remote_api_key": db_cfg.get("embed_remote_api_key", "") if db_cfg.get("embed_remote_api_key") else "",
-        "embed_remote_api_key_set": bool(db_cfg.get("embed_remote_api_key")),
-        "rerank_mode": db_cfg.get("rerank_mode") or settings.rerank_mode,
-        "rerank_remote_provider": db_cfg.get("rerank_remote_provider") or settings.rerank_remote_provider,
-        "rerank_remote_model": db_cfg.get("rerank_remote_model") or settings.rerank_remote_model,
-        "rerank_remote_base_url": db_cfg.get("rerank_remote_base_url") or settings.rerank_remote_base_url,
-        "rerank_remote_api_key": db_cfg.get("rerank_remote_api_key", "") if db_cfg.get("rerank_remote_api_key") else "",
-        "rerank_remote_api_key_set": bool(db_cfg.get("rerank_remote_api_key")),
+        # Qwen
+        "qwen_api_key": _val("qwen_api_key", settings.qwen_api_key, settings.llm_api_key),
+        "qwen_api_key_set": _set_flag("qwen_api_key", settings.qwen_api_key, settings.llm_api_key),
+        "qwen_base_url": _val("qwen_base_url", settings.qwen_base_url, settings.llm_base_url),
+        "qwen_model": _val("qwen_model", settings.qwen_model, settings.llm_model),
+        # DeepSeek
+        "deepseek_api_key": _val("deepseek_api_key", settings.deepseek_api_key, settings.llm_api_key),
+        "deepseek_api_key_set": _set_flag("deepseek_api_key", settings.deepseek_api_key, settings.llm_api_key),
+        "deepseek_base_url": _val("deepseek_base_url", settings.deepseek_base_url, settings.llm_base_url),
+        "deepseek_model": _val("deepseek_model", settings.deepseek_model, settings.llm_model),
+        # Ollama
+        "ollama_api_key": _val("ollama_api_key", settings.ollama_api_key),
+        "ollama_api_key_set": _set_flag("ollama_api_key", settings.ollama_api_key),
+        "ollama_base_url": _val("ollama_base_url", settings.ollama_base_url),
+        "ollama_model": _val("ollama_model", settings.ollama_model),
+        # Legacy 通用字段（兼容旧前端 / 内部使用）
+        "llm_api_key": _val("llm_api_key", settings.llm_api_key),
+        "llm_api_key_set": _set_flag("llm_api_key", settings.llm_api_key),
+        "llm_base_url": _val("llm_base_url", settings.llm_base_url),
+        "llm_model": _val("llm_model", settings.llm_model),
+        # Embedding
+        "embed_mode": _val("embed_mode", settings.embed_mode),
+        "embed_remote_provider": _val("embed_remote_provider", settings.embed_remote_provider),
+        "embed_remote_model": _val("embed_remote_model", settings.embed_remote_model),
+        "embed_remote_base_url": _val("embed_remote_base_url", settings.embed_remote_base_url),
+        "embed_remote_api_key": _val("embed_remote_api_key", settings.embed_remote_api_key),
+        "embed_remote_api_key_set": _set_flag("embed_remote_api_key", settings.embed_remote_api_key),
+        # Rerank
+        "rerank_mode": _val("rerank_mode", settings.rerank_mode),
+        "rerank_remote_provider": _val("rerank_remote_provider", settings.rerank_remote_provider),
+        "rerank_remote_model": _val("rerank_remote_model", settings.rerank_remote_model),
+        "rerank_remote_base_url": _val("rerank_remote_base_url", settings.rerank_remote_base_url),
+        "rerank_remote_api_key": _val("rerank_remote_api_key", settings.rerank_remote_api_key),
+        "rerank_remote_api_key_set": _set_flag("rerank_remote_api_key", settings.rerank_remote_api_key),
     }
     return response
 
@@ -1209,175 +1681,139 @@ async def _run_import_task(
     persona_id: str,
     name: str,
     file_path: str,
-    min_messages: int,
+    min_messages: int = 5,
 ):
-    """Background async task: stream parse, per-sender temp files, build personas.
-    Memory: O(max_sender_messages) ? each sender processed independently.
+    """Background task: parse JSONL, split by sender, write to chat_records/.
+    No auto-build. Files are persistent until user deletes them.
     """
     import json as _json
     import os as _os
-    from collections import Counter, defaultdict
+    from pathlib import Path as _Path
+
+    chat_dir = _Path("data/chat_records")
+    chat_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Phase 1: Stream parse ? per-sender temp JSONL files (constant memory)
+        # Phase 1: Stream parse + split by sender
         update_import_task(task_id, phase="parsing", progress_current=0)
         total, gen, member_map = await count_and_parse_messages(file_path)
-        logger.info("DEBUG parsing: total=%s member_map_keys=%s", total, len(member_map))
         update_import_task(task_id, phase="parsing", progress_total=total)
 
-        tmp_dir = Path("data/tmp")
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        sender_info: dict[str, tuple[object, Path, int]] = {}  # sender -> (fh, path, count)
-
-        # ????????????????????????????
-        timeline_path = tmp_dir / f"{task_id}_timeline.jsonl"
-        timeline_fh = open(str(timeline_path), "w", encoding="utf-8")
-
-        def _safe_name(s: str) -> str:
-            return s.replace(" ", "_").replace("/", "_").replace("\\", "_")[:80]
-
+        timeline_path = chat_dir / "_timeline.jsonl"
+        sender_messages: dict[str, int] = {}  # platformId -> count
+        sender_names: dict[str, str] = {}     # platformId -> accountName
+        discovered_senders: list[str] = []    # 按发现顺序记录，用于前端实时展示
         parsed = 0
+
+        # 预加载已存在文件的 platformMessageId 集合（用于去重）
+        existing_ids: dict[str, set[str]] = {}
+        for fpath in chat_dir.iterdir():
+            if fpath.name.endswith(".jsonl") and fpath.name != "_timeline.jsonl" and not fpath.name.startswith("_"):
+                pid = fpath.stem
+                existing_ids[pid] = set()
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = _json.loads(line)
+                                mid = obj.get("platform_message_id", "")
+                                if mid:
+                                    existing_ids[pid].add(mid)
+                            except _json.JSONDecodeError:
+                                pass
+                except Exception:
+                    pass
+
+        # 打开所有文件句柄（追加模式）
+        file_handles: dict[str, object] = {}
+        timeline_fh = open(timeline_path, "a", encoding="utf-8")
+
+        def _ensure_fh(platform_id: str):
+            if platform_id not in file_handles:
+                fpath = chat_dir / f"{platform_id}.jsonl"
+                fh = open(fpath, "a", encoding="utf-8")
+                file_handles[platform_id] = fh
+            return file_handles[platform_id]
+
         async for msg in gen:
+            # 取消检查
+            task_check = get_import_task(task_id)
+            if task_check and task_check["status"] == "cancelled":
+                logger.info("Import %s cancelled", task_id)
+                break
+
             norm = normalize_message(msg, member_map)
             if not norm:
                 parsed += 1
-                if parsed % 1000 == 0:
-                    update_import_task(task_id, progress_current=parsed)
                 continue
 
-            sender = norm["sender"]
-            sname = _safe_name(sender)
-            if sender not in sender_info:
-                fpath = tmp_dir / f"{task_id}_{sname}.jsonl"
-                fh = open(str(fpath), "w", encoding="utf-8")
-                sender_info[sender] = (fh, fpath, 0)
-            else:
-                fh, fpath, cnt = sender_info[sender]
+            platform_id = norm.get("platform_id", "") or norm.get("sender", "")
+            if not platform_id:
+                parsed += 1
+                continue
 
-            fh.write(_json.dumps(norm, ensure_ascii=False) + "\n")
-            sender_info[sender] = (fh, fpath, sender_info[sender][2] + 1)
+            # 去重检查
+            msg_id = norm.get("platform_message_id", "")
+            if msg_id and platform_id in existing_ids:
+                if msg_id in existing_ids[platform_id]:
+                    parsed += 1
+                    continue
+                existing_ids[platform_id].add(msg_id)
 
-            # ????????????per-sender + full-timeline?
-            timeline_fh.write(_json.dumps(norm, ensure_ascii=False) + "\n")
+            # 写入对应文件
+            line_json = _json.dumps(norm, ensure_ascii=False)
+            fh = _ensure_fh(platform_id)
+            fh.write(line_json + "\n")
 
+            # 写入时间线（复用句柄，避免每条消息 open/close）
+            timeline_fh.write(line_json + "\n")
+
+            # 统计
+            sender_messages[platform_id] = sender_messages.get(platform_id, 0) + 1
+            sender_names[platform_id] = norm["sender"]
+            if sender_messages[platform_id] == 1:
+                discovered_senders.append(norm["sender"])
             parsed += 1
-            if parsed % 1000 == 0:
+            if parsed % 500 == 0:
                 update_import_task(task_id, progress_current=parsed)
 
-        # Close all temp file handles
+        # 关闭所有文件句柄
         timeline_fh.close()
-        for fh, _, _ in sender_info.values():
+        for fh in file_handles.values():
             fh.close()
 
-        total_normalized = sum(cnt for _, _, cnt in sender_info.values())
-        update_import_task(task_id, progress_current=total_normalized)
-        logger.info("DEBUG sender_info: %d senders, names=%s", len(sender_info), list(sender_info.keys())[:10])
-        logger.info("Streamed %d messages ? %d senders (temp files)", total_normalized, len(sender_info))
+        logger.info("Import %s: %d messages, %d senders", task_id, parsed, len(sender_messages))
 
-        if not sender_info:
+        if not sender_messages:
             update_import_task(task_id, status="failed", error_message="No valid messages found")
             return
 
-        # Phase 2: Build personas from per-sender files
-        update_import_task(task_id, phase="building", progress_current=0, progress_total=0)
+        # 保存导入结果：发送者列表 + 原始文件名
+        sender_list = sorted([
+            {"platform_id": pid, "name": sender_names.get(pid, pid), "count": cnt}
+            for pid, cnt in sender_messages.items()
+        ], key=lambda x: x["count"], reverse=True)
 
-        eligible = sorted(
-            [(sdr, fpath, cnt) for sdr, (_, fpath, cnt) in sender_info.items() if cnt >= min_messages],
-            key=lambda x: x[2], reverse=True,
-        )
-        skipped = len(sender_info) - len(eligible)
-        total_persona = len(eligible)
-        update_import_task(task_id, progress_total=total_persona, skipped=skipped)
-
-        sem = asyncio.Semaphore(3)
-        profiles = []
-        profile_lock = asyncio.Lock()
-
-        async def build_one(sdr: str, fpath: Path, count: int, index: int):
-            async with sem:
-                # Check for cancellation before building each persona
-                task_check = get_import_task(task_id)
-                if task_check and task_check["status"] == "cancelled":
-                    return
-                safe_id = sdr.replace(" ", "_").replace("/", "_")[:80]
-                logger.info("  Building persona: %s (%d msgs)", safe_id, count)
-                try:
-                    msgs = []
-                    with open(str(fpath), "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line:
-                                try:
-                                    msgs.append(_json.loads(line))
-                                except _json.JSONDecodeError:
-                                    pass
-
-                    profile = await build_persona_pipeline(
-                        persona_id=safe_id,
-                        name=sdr,
-                        messages=msgs,
-                        speaker=sdr,
-                        message_count=count,
-                    )
-                    async with profile_lock:
-                        profiles.append({
-                            "id": safe_id,
-                            "name": sdr,
-                            "message_count": count,
-                            "style": profile.style.model_dump(),
-                            "ocean": profile.ocean.model_dump(),
-                        })
-                        update_import_task(task_id, progress_current=len(profiles), profiles_created=len(profiles))
-                except Exception as e:
-                    logger.warning("  Persona %s failed: %s", safe_id, e)
-                    update_import_task(task_id, progress_current=len(profiles) + 1)
-                finally:
-                    try:
-                        _os.unlink(str(fpath))
-                    except Exception:
-                        pass
-
-        tasks = [build_one(sdr, fpath, cnt, i) for i, (sdr, fpath, cnt) in enumerate(eligible)]
-        await asyncio.gather(*tasks)
-
-        # Clean up skipped senders
-        for sdr, (_, fpath, _) in sender_info.items():
-            try:
-                _os.unlink(str(fpath))
-            except Exception:
-                pass
-
-        sender_counts = {sdr: cnt for sdr, (_, _, cnt) in sender_info.items()}
         result = {
             "success": True,
-            "total_senders": len(sender_info),
-            "profiles_created": len(profiles),
-            "skipped": skipped,
-            "profiles": profiles,
-            "sender_stats": dict(sorted(sender_counts.items(), key=lambda x: x[1], reverse=True)[:20]),
+            "source_file": _os.path.basename(file_path),
+            "group_name": name,
+            "total_messages": parsed,
+            "total_senders": len(sender_list),
+            "senders": sender_list,
         }
         update_import_task(
             task_id, status="done", phase="done",
-            profiles_created=len(profiles), skipped=skipped,
             result_json=_json.dumps(result, ensure_ascii=False),
         )
-        # Store timeline path for deep profile
-        set_config(f"import_{task_id}_timeline", str(timeline_path))
-        logger.info("Import %s complete: %d profiles, timeline at %s", task_id, len(profiles), timeline_path)
+        logger.info("Import %s complete: %d senders", task_id, len(sender_list))
 
     except Exception as e:
         logger.exception("Import task %s failed", task_id)
         update_import_task(task_id, status="failed", error_message=str(e))
-    finally:
-        try:
-            import os
-            if os.path.exists(file_path) and "uploads" not in file_path:
-                os.unlink(file_path)
-        except Exception:
-            pass
-
-
-
 @router.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str):
     """Cancel a running import task."""
@@ -1385,4 +1821,6 @@ async def cancel_task(task_id: str):
     if not ok:
         raise HTTPException(400, "Task not found or already completed/failed")
     return {"success": True, "task_id": task_id, "status": "cancelled"}
+
+
 

@@ -19,16 +19,33 @@ class Settings(BaseSettings):
     chroma_dir: Path = Path("data/chroma")
     sqlite_path: Path = Path("data/mirrortalk.db")
 
-    # ---- LLM 默认 Provider ----
+    # ---- LLM Provider 配置（按 provider 分类） ----
     llm_provider: Literal["openai", "deepseek", "qwen", "custom"] = "qwen"
+
+    # Qwen（通义千问）
+    qwen_api_key: str = ""
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    qwen_model: str = "qwen-turbo"
+
+    # DeepSeek
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_model: str = "deepseek-chat"
+
+    # Ollama（本地）
+    ollama_api_key: str = ""
+    ollama_base_url: str = "http://localhost:11434/v1"
+    ollama_model: str = "qwen2.5:7b"
+
+    # OpenAI
+    openai_api_key: str = ""
+    openai_base_url: str = ""
+    openai_model: str = "gpt-4o-mini"
+
+    # ---- 运行时默认值（指向上述某个 provider，前端设置页保存后覆盖） ----
     llm_api_key: str = ""
     llm_base_url: str = ""
     llm_model: str = "qwen-plus"
-    # ? provider ?? API key????????DB?env??fallback?
-    qwen_api_key: str = ""
-    deepseek_api_key: str = ""
-    openai_api_key: str = ""
-    ollama_api_key: str = ""  # ollama ???? key
 
     # ---- Embedding ----
     embed_mode: Literal["local", "remote"] = "local"
